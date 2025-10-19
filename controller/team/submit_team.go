@@ -1,6 +1,7 @@
 package team
 
 import (
+	"log"
 	"strconv"
 	"walk-server/global"
 	"walk-server/model"
@@ -15,18 +16,17 @@ var submit = redis.NewScript(`
 local teamID = KEYS[1];
 local dailyRouteKey = KEYS[2];
 
-local teamExists = redis.call("sismember", "teams", teamID);
-if tonumber(teamExists) == 1 then
-	return 1;
-end
-
-local num=redis.call("get", dailyRouteKey);
-if tonumber(num) <= 0 then
+local num = redis.call("get", dailyRouteKey);
+if not num or tonumber(num) <= 0 then
 	return 2;
 end
 
+local added = redis.call("SAdd", "teams", teamID);
+if added == 0 then
+	return 1;
+end
+
 redis.call("decr", dailyRouteKey);
-redis.call("SAdd", "teams", teamID);
 return 0;
 `)
 
@@ -51,6 +51,7 @@ func SubmitTeam(context *gin.Context) {
 
 	result := global.DB.Where("id = ?", person.TeamId).Take(&team)
 	if result.Error != nil {
+		log.Println(result.Error)
 		utility.ResponseError(context, "系统异常，请重试")
 		return
 	} else if team.Num < 4 {
@@ -62,16 +63,17 @@ func SubmitTeam(context *gin.Context) {
 	dailyRoute := utility.GetCurrentDate()*10 + team.Route
 	dailyRouteKey := strconv.Itoa(int(dailyRoute))
 	// 运行Lua脚本
-	n, err := submit.Run(global.Rctx, global.Rdb, []string{teamID, dailyRouteKey}).Result()
+	n, err := submit.Run(global.Rctx, global.Rdb, []string{teamID, dailyRouteKey}).Int64()
 	if err != nil {
+		log.Println(err)
 		utility.ResponseError(context, "系统异常，请重试")
 		return
 	}
 
-	if n.(int64) == 1 {
+	if n == 1 {
 		utility.ResponseError(context, "队伍已提交")
 		return
-	} else if n.(int64) == 2 {
+	} else if n == 2 {
 		utility.ResponseError(context, "队伍数量已经到达上限，无法提交")
 		return
 	}

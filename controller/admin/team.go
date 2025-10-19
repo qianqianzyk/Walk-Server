@@ -2,6 +2,7 @@ package admin
 
 import (
 	"errors"
+	"log"
 	"strconv"
 	"time"
 	"walk-server/constant"
@@ -123,6 +124,7 @@ func BindTeam(c *gin.Context) {
 		utility.ResponseError(c, "二维码已绑定")
 		return
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		log.Println(err)
 		utility.ResponseError(c, "服务错误，请联系负责人")
 		return
 	}
@@ -156,7 +158,7 @@ func BindTeam(c *gin.Context) {
 	team.Status = 5
 	team.StartNum = num
 	team.Time = time.Now()
-	teamService.Update(*team)
+	teamService.Update(team)
 	utility.ResponseSuccess(c, nil)
 }
 
@@ -219,7 +221,7 @@ func UpdateTeamStatus(c *gin.Context) {
 	if num == 0 {
 		team.Status = 3
 		team.Point = int8(constant.PointMap[team.Route])
-		teamService.Update(*team)
+		teamService.Update(team)
 		utility.ResponseSuccess(c, gin.H{
 			"progress_num": 0,
 		})
@@ -230,20 +232,24 @@ func UpdateTeamStatus(c *gin.Context) {
 	switch team.Route {
 	case 2:
 		if user.Route == 3 && (user.Point == 2 || user.Point == 3 || user.Point == 4) {
+			global.Rdb.SAdd(global.Rctx, "wrong_route_teams:pfAll", team.ID)
 			utility.ResponseError(c, "该队伍为半程路线，让队伍继续往前走就行")
 			return
 		}
-		if user.Point > 2 {
+		if user.Route == 3 && user.Point > 2 {
 			team.Point = user.Point - 2
 		} else {
 			team.Point = user.Point
 		}
+		global.Rdb.SRem(global.Rctx, "wrong_route_teams:pfAll", team.ID)
 	case 3:
 		if user.Route == 2 && user.Point == 2 {
+			global.Rdb.SAdd(global.Rctx, "wrong_route_teams:pfHalf", team.ID)
 			utility.ResponseError(c, "该队伍为全程路线，让队伍继续往前走就行")
 			return
 		}
 		team.Point = user.Point
+		global.Rdb.SRem(global.Rctx, "wrong_route_teams:pfHalf", team.ID)
 	default:
 		team.Point = user.Point
 	}
@@ -251,12 +257,13 @@ func UpdateTeamStatus(c *gin.Context) {
 	for _, p := range persons {
 		if p.WalkStatus == 3 {
 			p.WalkStatus = 2
-			userService.Update(p)
+			userService.Update(&p)
 		}
 	}
 	team.Time = time.Now()
 	team.Status = 2
-	teamService.Update(*team)
+	team.IsLost = false
+	teamService.Update(team)
 	utility.ResponseSuccess(c, gin.H{
 		"progress_num": num,
 	})
@@ -303,31 +310,31 @@ func PostDestination(c *gin.Context) {
 		return
 	}
 
+	team.Point = int8(constant.PointMap[team.Route])
+
 	if num == 0 {
 		team.Status = 3
-		team.Point = int8(constant.PointMap[team.Route])
-		teamService.Update(*team)
+		teamService.Update(team)
 		utility.ResponseSuccess(c, nil)
 		return
 	}
 
-	team.Point = int8(constant.PointMap[team.Route])
 	team.Time = time.Now()
 
 	if postForm.Status == 1 {
 		for _, p := range persons {
 			if p.WalkStatus == 2 || p.WalkStatus == 3 {
 				p.WalkStatus = 5
-				userService.Update(p)
+				userService.Update(&p)
 			}
 		}
 		team.Status = 4
-		teamService.Update(*team)
+		teamService.Update(team)
 		utility.ResponseSuccess(c, nil)
 		return
 	} else {
 		team.Status = 3
-		teamService.Update(*team)
+		teamService.Update(team)
 		utility.ResponseSuccess(c, nil)
 		return
 	}
@@ -337,6 +344,8 @@ type RegroupForm struct {
 	Jwts   []string `json:"jwts" binding:"required"`
 	Secret string   `json:"secret" binding:"required"`
 	Route  uint8    `json:"route" binding:"required"`
+	Name   string   `json:"name"`
+	Slogan string   `json:"slogan"`
 }
 
 func Regroup(c *gin.Context) {
@@ -352,17 +361,16 @@ func Regroup(c *gin.Context) {
 		return
 	}
 
-	var persons []model.Person
+	var persons []*model.Person
 	processedJwts := make(map[string]bool)
 	for _, jwt := range postForm.Jwts {
 		if processedJwts[jwt] {
-			utility.ResponseError(c, "重复扫码,请重新提交")
+			continue
 		}
 		processedJwts[jwt] = true
 
 		jwtToken := jwt[7:]
 		jwtData, err := utility.ParseToken(jwtToken)
-
 		if err != nil {
 			utility.ResponseError(c, "扫码错误，请重新扫码")
 			return
@@ -370,7 +378,6 @@ func Regroup(c *gin.Context) {
 
 		// 获取个人信息
 		person, err := model.GetPerson(jwtData.OpenID)
-
 		if err != nil {
 			utility.ResponseError(c, "扫码错误，请重新扫码")
 			return
@@ -378,66 +385,65 @@ func Regroup(c *gin.Context) {
 
 		// 如果已有队伍则获取队伍信息
 		if person.TeamId != -1 {
-			team, _ := teamService.GetTeamByID(uint(person.TeamId))
+			team, err := teamService.GetTeamByID(uint(person.TeamId))
+			if err != nil {
+				log.Println(err)
+				utility.ResponseError(c, "服务错误")
+				return
+			}
 			if team.Status != 1 {
 				utility.ResponseError(c, person.Name+"的原队伍已开始，请勿重新组队")
 				return
 			}
-		}
 
-		persons = append(persons, *person)
-	}
-
-	for _, person := range persons {
-		// 如果已有队伍则退出
-		if person.TeamId != -1 {
-			captain, persons := model.GetPersonsInTeam(person.TeamId)
-			for _, p := range persons {
+			// 清空队伍成员
+			captain, members := model.GetPersonsInTeam(person.TeamId)
+			for _, p := range members {
 				p.TeamId = -1
 				p.Status = 0
 				p.WalkStatus = 1
-				userService.Update(p)
+				userService.Update(&p)
 			}
 			captain.TeamId = -1
 			captain.Status = 0
 			captain.WalkStatus = 1
-			userService.Update(captain)
-			team, err := teamService.GetTeamByID(uint(person.TeamId))
-			if err == nil {
-				err = teamService.Delete(*team)
-				if err != nil {
-					utility.ResponseError(c, "服务错误")
-					return
-				}
-			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			userService.Update(&captain)
+
+			// 删除队伍
+			if err := teamService.Delete(team); err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				log.Println(err)
 				utility.ResponseError(c, "服务错误")
 				return
 			}
 		}
+
+		persons = append(persons, person)
+	}
+
+	if postForm.Name == "" {
+		postForm.Name = "新队伍"
+	}
+
+	if postForm.Slogan == "" {
+		postForm.Slogan = "新的开始"
 	}
 
 	// 创建新队伍，第一个人作为队长
 	newTeam := model.Team{
-		Name:       "新队伍",
+		Name:       postForm.Name,
 		Route:      postForm.Route,
 		Password:   "123456",
 		AllowMatch: true,
-		Slogan:     "新的开始",
+		Slogan:     postForm.Slogan,
 		Point:      -1,
 		Status:     1,
-		StartNum:   uint(0),
+		StartNum:   0,
 		Num:        uint8(len(persons)),
 		Captain:    persons[0].OpenId,
 		Submit:     true,
-		Time:       time.Now().Add(8 * time.Hour),
+		Time:       time.Now(),
 	}
-	err = teamService.Create(newTeam)
-	if err != nil {
-		utility.ResponseError(c, "服务错误")
-		return
-	}
-
-	team, err := teamService.GetTeamByCaptain(persons[0].OpenId)
+	err = teamService.Create(&newTeam)
 	if err != nil {
 		utility.ResponseError(c, "服务错误")
 		return
@@ -445,7 +451,7 @@ func Regroup(c *gin.Context) {
 
 	// 更新每个人的队伍ID
 	for i, person := range persons {
-		person.TeamId = int(team.ID)
+		person.TeamId = int(newTeam.ID)
 		if i == 0 {
 			person.Status = 2
 		} else {
@@ -484,7 +490,7 @@ func SubmitTeam(c *gin.Context) {
 	}
 
 	team.Submit = true
-	teamService.Update(*team)
+	teamService.Update(team)
 	global.Rdb.SAdd(global.Rctx, "teams", strconv.Itoa(int(team.ID)))
 	utility.ResponseSuccess(c, nil)
 
@@ -495,8 +501,9 @@ type GetDetailForm struct {
 }
 
 type RouteDetail struct {
-	Count int64  `json:"count"`
-	Label string `json:"label"`
+	Count2 *int64 `json:"count2,omitempty"`
+	Count  int64  `json:"count"`
+	Label  string `json:"label"`
 }
 
 // GetDetail 获取全部路线的点位信息
@@ -524,8 +531,8 @@ func GetDetail(c *gin.Context) {
 		resultMap[key] = make([]int64, constant.PointMap[uint8(route)]+3)
 	}
 
-	// 获取各点位人数
-	getPointCounts := func(route int, status []int, team_stuats []int, points []int64) {
+	// 获取各点位人数（当前在该点位的人数）
+	getPointCounts := func(route int, status []int, teamStatus []int, points []int64) {
 		var pointCounts []struct {
 			Point int64
 			Count int64
@@ -533,7 +540,7 @@ func GetDetail(c *gin.Context) {
 		global.DB.Model(&model.Person{}).
 			Select("teams.point, count(*) as count").
 			Joins("JOIN teams ON people.team_id = teams.id").
-			Where("teams.route = ? AND people.walk_status IN ? AND teams.status IN ?", route, status, team_stuats).
+			Where("teams.route = ? AND people.walk_status IN ? AND teams.status IN ?", route, status, teamStatus).
 			Group("teams.point").
 			Order("teams.point").
 			Scan(&pointCounts)
@@ -572,7 +579,7 @@ func GetDetail(c *gin.Context) {
 		points[len(points)-1] = endCount4
 	}
 
-	// 状态：进行中、未开始、已结束
+	// 状态：进行中、未出发、已结束
 	personStatusInProgress := []int{2, 3}
 	teamStatusInProgress := []int{2, 5}
 
@@ -584,11 +591,22 @@ func GetDetail(c *gin.Context) {
 
 	processRoute := func(routeName string, routeID int) []RouteDetail {
 		details := make([]RouteDetail, len(resultMap[routeName]))
+
+		// 先计算每个点位的count2（经过该点位的总人数）
+		count2Array := make([]int64, len(resultMap[routeName]))
+		for i := len(resultMap[routeName]) - 3; i >= 0; i-- { // 从倒数第三个开始向前累加
+			if i == len(resultMap[routeName])-3 {
+				count2Array[i] = resultMap[routeName][i]
+			} else {
+				count2Array[i] = resultMap[routeName][i] + count2Array[i+1]
+			}
+		}
+
 		for i, count := range resultMap[routeName] {
 			label := ""
 			switch i {
 			case 0:
-				label = "未开始"
+				label = "未出发"
 			case len(resultMap[routeName]) - 2:
 				label = "已结束"
 			case len(resultMap[routeName]) - 1:
@@ -596,9 +614,21 @@ func GetDetail(c *gin.Context) {
 			default:
 				label = constant.GetPointName(uint8(routeID), int8(i-1))
 			}
-			details[i] = RouteDetail{
-				Count: count,
-				Label: label,
+
+			// 只有普通点位需要count2
+			if i != 0 && i != len(resultMap[routeName])-2 && i != len(resultMap[routeName])-1 {
+				// 使用累加计算出的经过该点位的总人数
+				details[i] = RouteDetail{
+					Count:  count,
+					Count2: &count2Array[i],
+					Label:  label,
+				}
+			} else {
+				// 特殊标签不需要count2
+				details[i] = RouteDetail{
+					Count: count,
+					Label: label,
+				}
 			}
 		}
 		return details
@@ -610,6 +640,29 @@ func GetDetail(c *gin.Context) {
 	pfHalfDetails := processRoute("pfHalf", 2)
 	mgsHalfDetails := processRoute("mgsHalf", 4)
 	mgsAllDetails := processRoute("mgsAll", 5)
+
+	// 为每条路线添加已出发总人数
+	addStartedTotal := func(details []RouteDetail) []RouteDetail {
+		var startedTotal int64
+		// 计算除了"未出发"之外的所有人员数量
+		for i, detail := range details {
+			// 跳过"未出发"（索引0）
+			if i > 0 {
+				startedTotal += detail.Count
+			}
+		}
+		// 添加已出发总人数标签
+		return append([]RouteDetail{{
+			Count: startedTotal,
+			Label: "已出发",
+		}}, details...)
+	}
+
+	zhDetails = addStartedTotal(zhDetails)
+	pfAllDetails = addStartedTotal(pfAllDetails)
+	pfHalfDetails = addStartedTotal(pfHalfDetails)
+	mgsHalfDetails = addStartedTotal(mgsHalfDetails)
+	mgsAllDetails = addStartedTotal(mgsAllDetails)
 
 	// 返回结果
 	utility.ResponseSuccess(c, gin.H{
@@ -651,7 +704,6 @@ func GetSubmitDetail(c *gin.Context) {
 
 	// 创建结果集合
 	var results Results
-	submit := 1
 
 	// 定义路线和队伍类型的映射
 	routes := []struct {
@@ -679,7 +731,7 @@ func GetSubmitDetail(c *gin.Context) {
 	// 获取各个路线的队伍数据
 	for _, r := range routes {
 		for _, t := range teamTypes {
-			teamCount, totalCount := getTeamStats(r.Route, submit, t.Type, t.IsMixed)
+			teamCount, totalCount := getTeamStats(r.Route, t.Type, t.IsMixed)
 
 			switch r.Name {
 			case "朝晖":
@@ -726,44 +778,28 @@ func GetSubmitDetail(c *gin.Context) {
 }
 
 // 定义一个函数用于统计队伍数量和总人数
-func getTeamStats(route int, submit int, captainType int, hasStudent bool) (int64, int64) {
+func getTeamStats(route int, captainType int, hasStudent bool) (int64, int64) {
 	var teamCount int64
 	var totalCount int64
 
 	// 基础查询
 	teamQuery := global.DB.Model(&model.Team{}).
+		Select("teams.id").
 		Joins("JOIN people AS captain ON captain.open_id = teams.captain").
-		Where("teams.route = ? AND teams.submit = ?", route, submit).
-		Where("captain.type = ?", captainType)
+		Where("teams.route = ? AND teams.submit = true AND captain.type = ?", route, captainType)
 
 	// 根据是否有学生的条件进行筛选
 	if captainType == 2 {
 		if hasStudent {
-			teamQuery = teamQuery.Where("EXISTS (SELECT 1 FROM people WHERE people.team_id = teams.id AND people.type = 1)")
+			teamQuery = teamQuery.Where("EXISTS (SELECT 1 FROM people p WHERE p.team_id = teams.id AND p.type = 1)")
 		} else {
-			teamQuery = teamQuery.Where("NOT EXISTS (SELECT 1 FROM people WHERE people.team_id = teams.id AND people.type = 1)")
+			teamQuery = teamQuery.Where("NOT EXISTS (SELECT 1 FROM people p WHERE p.team_id = teams.id AND p.type = 1)")
 		}
 	}
 
 	// 统计队伍数量
 	teamQuery.Count(&teamCount)
-
-	// 统计总人数
-	totalQuery := global.DB.Model(&model.Person{}).
-		Joins("JOIN teams ON people.team_id = teams.id").
-		Joins("JOIN people AS captain ON captain.open_id = teams.captain").
-		Where("teams.route = ? AND teams.submit = ?", route, submit).
-		Where("captain.type = ?", captainType)
-
-	if captainType == 2 {
-		if hasStudent {
-			totalQuery = totalQuery.Where("EXISTS (SELECT 1 FROM people WHERE people.team_id = teams.id AND people.type = 1)")
-		} else {
-			totalQuery = totalQuery.Where("NOT EXISTS (SELECT 1 FROM people WHERE people.team_id = teams.id AND people.type = 1)")
-		}
-	}
-
-	totalQuery.Count(&totalCount)
+	global.DB.Model(&model.Person{}).Where("team_id IN (?)", teamQuery).Count(&totalCount)
 
 	return teamCount, totalCount
 }
@@ -827,5 +863,167 @@ func GetTeamBySecret(c *gin.Context) {
 			"submit":      team.Submit,
 		},
 		"member": memberData,
+	})
+}
+
+// SetTeamLostForm 标记队伍失联表单
+type SetTeamLostForm struct {
+	TeamID uint   `json:"team_id" binding:"required"`
+	Secret string `json:"secret" binding:"required"`
+}
+
+// SetTeamLost 标记队伍为失联
+func SetTeamLost(c *gin.Context) {
+	var postForm SetTeamLostForm
+	err := c.ShouldBindJSON(&postForm)
+	if err != nil {
+		utility.ResponseError(c, "参数错误")
+		return
+	}
+
+	if postForm.Secret != global.Config.GetString("server.secret") {
+		utility.ResponseError(c, "密码错误")
+		return
+	}
+
+	team, err := teamService.GetTeamByID(postForm.TeamID)
+	if team == nil || err != nil {
+		utility.ResponseError(c, "队伍查找失败，请重新核对")
+		return
+	}
+
+	team.IsLost = !team.IsLost
+	teamService.Update(team)
+	if team.IsLost {
+		utility.ResponseData(c, 200, "标记失联成功", nil)
+	} else {
+		utility.ResponseData(c, 200, "取消标记失联成功", nil)
+	}
+}
+
+// GetLostTeamsForm 获取失联队伍列表表单
+type GetLostTeamsForm struct {
+	Secret string `form:"secret" binding:"required"`
+}
+
+// GetLostTeams 获取失联队伍列表
+func GetLostTeams(c *gin.Context) {
+	var queryForm GetLostTeamsForm
+	err := c.ShouldBindQuery(&queryForm)
+
+	if err != nil {
+		utility.ResponseError(c, "参数错误")
+		return
+	}
+
+	if queryForm.Secret != global.Config.GetString("server.secret") {
+		utility.ResponseError(c, "密码错误")
+		return
+	}
+
+	var lostTeams []model.Team
+	global.DB.Where("is_lost = ?", true).Find(&lostTeams)
+
+	var teamData []gin.H
+	for _, team := range lostTeams {
+		// 获取队伍成员信息
+		var persons []model.Person
+		global.DB.Where("team_id = ?", team.ID).Find(&persons)
+
+		// 构造成员联系方式信息
+		var memberData []gin.H
+		for _, member := range persons {
+			memberData = append(memberData, gin.H{
+				"name": member.Name,
+				"contact": gin.H{
+					"qq":     member.Qq,
+					"wechat": member.Wechat,
+					"tel":    member.Tel,
+				},
+			})
+		}
+
+		teamData = append(teamData, gin.H{
+			"id":      team.ID,
+			"name":    team.Name,
+			"route":   team.Route,
+			"members": memberData,
+		})
+	}
+
+	utility.ResponseSuccess(c, gin.H{
+		"teams": teamData,
+	})
+}
+
+// GetWrongRouteTeamsForm 获取走错路线队伍数量表单
+type GetWrongRouteTeamsForm struct {
+	Secret string `form:"secret" binding:"required"`
+}
+
+// GetWrongRouteTeams 获取走错路线的队伍数量
+func GetWrongRouteTeams(c *gin.Context) {
+	var queryForm GetWrongRouteTeamsForm
+	err := c.ShouldBindQuery(&queryForm)
+
+	if err != nil {
+		utility.ResponseError(c, "参数错误")
+		return
+	}
+
+	if queryForm.Secret != global.Config.GetString("server.secret") {
+		utility.ResponseError(c, "密码错误")
+		return
+	}
+
+	// 从Redis中获取走错路线的队伍ID列表
+	pfAllTeamIDs, err1 := global.Rdb.SMembers(global.Rctx, "wrong_route_teams:pfAll").Result()
+	pfHalfTeamIDs, err2 := global.Rdb.SMembers(global.Rctx, "wrong_route_teams:pfHalf").Result()
+	if err1 != nil || err2 != nil {
+		utility.ResponseError(c, "获取数据失败")
+		return
+	}
+
+	// 计算屏峰全程路线走错的队伍总人数
+	var pfAllCount int64
+	if len(pfAllTeamIDs) > 0 {
+		// 将字符串类型的ID转换为整数
+		var pfAllTeamIDInts []uint
+		for _, idStr := range pfAllTeamIDs {
+			if id, err := strconv.ParseUint(idStr, 10, 32); err == nil {
+				pfAllTeamIDInts = append(pfAllTeamIDInts, uint(id))
+			}
+		}
+
+		// 查询这些队伍的成员数量
+		if len(pfAllTeamIDInts) > 0 {
+			var count int64
+			global.DB.Model(&model.Person{}).Where("team_id IN ?", pfAllTeamIDInts).Count(&count)
+			pfAllCount = count
+		}
+	}
+
+	// 计算屏峰半程路线走错的队伍总人数
+	var pfHalfCount int64
+	if len(pfHalfTeamIDs) > 0 {
+		// 将字符串类型的ID转换为整数
+		var pfHalfTeamIDInts []uint
+		for _, idStr := range pfHalfTeamIDs {
+			if id, err := strconv.ParseUint(idStr, 10, 32); err == nil {
+				pfHalfTeamIDInts = append(pfHalfTeamIDInts, uint(id))
+			}
+		}
+
+		// 查询这些队伍的成员数量
+		if len(pfHalfTeamIDInts) > 0 {
+			var count int64
+			global.DB.Model(&model.Person{}).Where("team_id IN ?", pfHalfTeamIDInts).Count(&count)
+			pfHalfCount = count
+		}
+	}
+
+	utility.ResponseSuccess(c, gin.H{
+		"pf_all_count":  pfAllCount,  // 屏峰走错为全程的数量
+		"pf_half_count": pfHalfCount, // 屏峰走错为半程的数量
 	})
 }

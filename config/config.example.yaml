@@ -15,7 +15,7 @@ frontend:
 database:
   host: "127.0.0.1"
   user: "root"
-  passport: ""
+  password: ""
   port: "3306"
   name: ""
 
@@ -54,11 +54,3 @@ wechat: # 微信小程序相关配置 (切记不能泄漏）
   appid:
   appsecret:
   driver: Redis
-
-number:
-  ZH:
-  PF_Half:
-  PF_All:
-  MGS_Half:
-  MGS_All:
-

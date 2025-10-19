@@ -68,11 +68,16 @@ func UserStatus(c *gin.Context) {
 	for _, form := range postForm.List {
 		person := users[form.UserID]
 		if form.Status == 1 {
-			person.WalkStatus = 3
+			// 只有在起点时才为3，其他时候改成2
+			if teams[person.TeamId].Point < 0 {
+				person.WalkStatus = 3
+			} else {
+				person.WalkStatus = 2
+			}
 		} else {
 			person.WalkStatus = 4
 		}
-		userService.Update(*person)
+		userService.Update(person)
 	}
 
 	// 检查队伍是否已经没人在行
@@ -94,7 +99,7 @@ func UserStatus(c *gin.Context) {
 		}
 		if num == 0 {
 			team.Status = 3
-			teamService.Update(team)
+			teamService.Update(&team)
 		}
 	}
 
@@ -145,8 +150,9 @@ type User struct {
 	TeamID     uint      `json:"team_id"`
 	TeamName   string    `json:"team_name"`
 	Status     uint8     `json:"status"`      // 1 队员，2 队长
-	WalkStatus uint8     `json:"walk_status"` // 1 未开始，2 进行中，3 扫码成功，4 放弃，5 完成
+	WalkStatus uint8     `json:"walk_status"` // 1 未出发，2 进行中，3 扫码成功，4 放弃，5 完成
 	Location   string    `json:"location"`
+	IsLost     bool      `json:"is_lost"`
 }
 
 type PointUsers struct {
@@ -266,7 +272,7 @@ func DownloadTimeoutUsers(c *gin.Context) {
 		campusMap     = map[uint8]string{1: "朝晖", 2: "屏峰", 3: "莫干山"}
 		typeMap       = map[uint8]string{1: "学生", 2: "教职工", 3: "校友"}
 		statusMap     = map[uint8]string{1: "队员", 2: "队长"}
-		walkStatusMap = map[uint8]string{1: "未开始", 2: "进行中", 3: "进行中", 4: "放弃", 5: "已完成"}
+		walkStatusMap = map[uint8]string{1: "未出发", 2: "进行中", 3: "进行中", 4: "放弃", 5: "已完成"}
 	)
 
 	// 预分配切片容量
@@ -371,6 +377,7 @@ func buildUserData(person model.Person, team model.Team) User {
 		Status:     person.Status,
 		WalkStatus: person.WalkStatus,
 		Location:   constant.GetPointName(team.Route, team.Point),
+		IsLost:     team.IsLost,
 	}
 }
 

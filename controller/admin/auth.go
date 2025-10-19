@@ -51,6 +51,7 @@ func AuthByPassword(c *gin.Context) {
 		return
 	}
 	if err != nil {
+		log.Println(err)
 		utility.ResponseError(c, "服务错误")
 		return
 	}
@@ -67,7 +68,7 @@ func AuthByPassword(c *gin.Context) {
 			return
 		}
 		user.WechatOpenID = session.OpenID
-		adminService.UpdateOpenID(*user)
+		adminService.UpdateOpenID(user)
 	}
 	var jwtData utility.JwtData
 	jwtData.OpenID = utility.AesEncrypt(strconv.Itoa(int(user.ID)), global.Config.GetString("server.AESSecret"))
@@ -135,11 +136,12 @@ func AuthWithoutCode(c *gin.Context) {
 		return
 	}
 	user, err := adminService.GetUserByAccount(postForm.Username)
-	if err == gorm.ErrRecordNotFound {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		utility.ResponseError(c, "账号错误")
 		return
 	}
 	if err != nil {
+		log.Println(err)
 		utility.ResponseError(c, "服务错误")
 		return
 	}
